@@ -1,0 +1,497 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/**
+- @title ShidoGuardEnterprise (V3.1 - Enterprise Masterpiece)
+- @notice Sistem Patroli NFC Tersentralisasi Berbasis Wallet.
+- @dev Menerapkan pola C-E-I (Checks-Effects-Interactions), perlindungan OOG (Out of Gas), 
+-      serta perbaikan casting tipe data int256 pada kalkulasi zona waktu.
+ */
+contract ShidoGuardEnterprise {
+
+    // ==========================================
+    // 1. STRUKTUR DATA
+    // ==========================================
+    struct ShiftRule {
+        uint8 shiftMode;
+        uint16 shift1Start;
+        uint16 shift2Start;
+        uint16 shift3Start;
+        int8 timezoneOffset;
+    }
+
+    struct Company {
+        address adminWallet;
+        string name;
+        uint256 gasTankBalance;
+        uint256 maxGasPriceRefund;
+        uint256 initialGuardFloat;
+        ShiftRule shiftRule;
+        uint256 totalGuards;
+        uint256 totalLogs;
+        bool isRegistered;
+    }
+
+    struct Zone {
+        bytes32 zoneId;
+        string zoneName;
+        bool isActive;
+    }
+
+    struct Post {
+        bytes32 postId;
+        bytes32 zoneId;
+        string postName;
+        bool isActive;
+    }
+
+    struct NFCPoint {
+        bytes32 nfcHash;
+        bytes32 zoneId;
+        bytes32 postId;
+        string nfcName;
+        string defaultTapNote;
+        bool isActive;
+    }
+
+    struct NFCDailyStatus {
+        uint256 lastDayIndex;
+        uint256 lastTapTime;
+        bytes32 lastGuardHash;
+        uint8 shiftIndex;
+        bool isPhysicallyTapped;
+        string note;
+    }
+
+    struct GuardAccount {
+        bytes32 usernameHash;
+        address activeWallet;
+        string profile;
+        bytes32 currentZoneId;
+        bytes32 currentPostId;
+        uint256 lastVerifiedTapTime;
+        bool isActive;
+    }
+
+    // ==========================================
+    // 2. STATE VARIABLES
+    // ==========================================
+    address public platformOwner;
+    uint256 public platformFeeBps = 200;
+    uint256 public totalPlatformFeeEarned;
+    uint256 public totalCompaniesRegistered;
+
+    uint256 private constant GAS_OVERHEAD = 36000;
+    bool private _locked;
+
+    mapping(address => Company) public companies;
+    
+    mapping(address => mapping(bytes32 => Zone)) public companyZones;
+    mapping(address => mapping(bytes32 => Post)) public companyPosts;
+    mapping(address => mapping(bytes32 => NFCPoint)) public companyNFCPoints;
+    mapping(address => mapping(bytes32 => NFCDailyStatus)) public nfcDailyStatus;
+
+    mapping(address => mapping(bytes32 => GuardAccount)) public companyGuards;
+    mapping(address => mapping(address => bytes32)) public walletToUsernameHash;
+
+    mapping(address => bytes32[]) public companyZoneList;
+    mapping(address => bytes32[]) public companyPostList;
+    mapping(address => bytes32[]) public companyNfcList;
+    mapping(address => bytes32[]) public companyGuardList;
+
+    // ==========================================
+    // 3. EVENTS
+    // ==========================================
+    event PlatformFeeUpdated(uint256 oldBps, uint256 newBps);
+    event PlatformOwnerTransferred(address indexed oldOwner, address indexed newOwner);
+    event CompanyRegistered(address indexed adminWallet, uint256 netGas, uint256 fee);
+    event GasTankDeposited(address indexed adminWallet, uint256 netAdded, uint256 fee, uint256 totalBalance);
+    event GasTankWithdrawn(address indexed adminWallet, uint256 amount);
+    event ShiftRuleUpdated(address indexed adminWallet, uint8 shiftMode, uint16 s1, uint16 s2, uint16 s3, int8 tz);
+    event ZoneSaved(address indexed adminWallet, bytes32 indexed zoneId, bool isActive);
+    event PostSaved(address indexed adminWallet, bytes32 indexed zoneId, bytes32 indexed postId, bool isActive);
+    event NFCPointSaved(address indexed adminWallet, bytes32 indexed postId, bytes32 indexed nfcHash, string defaultNote, bool isActive);
+    event GuardSaved(address indexed adminWallet, bytes32 indexed usernameHash, address activeWallet, bool isActive);
+    event GuardAutoRolled(address indexed adminWallet, bytes32 indexed usernameHash, bytes32 newZoneId, bytes32 newPostId);
+    event PatrolRecorded(address indexed adminWallet, uint256 indexed logId, uint256 indexed dayIndex, bytes32 usernameHash, bytes32 zoneId, bytes32 postId, bytes32 recordedNfcHash, bool isPhysicallyTapped, bool isOfflineSynced, uint8 shiftIndex, uint256 actualTapTime, uint256 gasRefunded);
+
+    // ==========================================
+    // 4. MODIFIERS (DISIPLIN KEAMANAN)
+    // ==========================================
+    modifier nonReentrant() {
+        require(!_locked, "ShidoGuard: Reentrant call");
+        _locked = true;
+        _;
+        _locked = false;
+    }
+
+    modifier onlyPlatformOwner() {
+        require(msg.sender == platformOwner, "ShidoGuard: Hanya Owner");
+        _;
+    }
+
+    modifier onlyCompanyAdmin() {
+        require(companies[msg.sender].isRegistered, "ShidoGuard: Anda bukan Admin PT");
+        _;
+    }
+
+    modifier onlyActiveGuard(address _adminWallet) {
+        bytes32 uHash = walletToUsernameHash[_adminWallet][msg.sender];
+        require(uHash != bytes32(0) && companyGuards[_adminWallet][uHash].isActive, "ShidoGuard: Sekuriti nonaktif/ilegal");
+        require(companyGuards[_adminWallet][uHash].activeWallet == msg.sender, "ShidoGuard: Wallet bentrok");
+        _;
+    }
+
+    constructor() {
+        platformOwner = msg.sender;
+    }
+
+    // ==========================================
+    // 5. PLATFORM ADMINISTRATION
+    // ==========================================
+    function setPlatformFeeBps(uint256 _newFeeBps) external onlyPlatformOwner {
+        require(_newFeeBps >= 200 && _newFeeBps <= 1000, "ShidoGuard: Limit komisi 2-10%");
+        platformFeeBps = _newFeeBps;
+    }
+
+    function transferPlatformOwnership(address _newOwner) external onlyPlatformOwner {
+        require(_newOwner != address(0), "ShidoGuard: Alamat tidak boleh nol");
+        platformOwner = _newOwner;
+    }
+
+    function getWalletRole(address _wallet) external view returns (uint8 role) {
+        if (_wallet == platformOwner) return 1;
+        if (companies[_wallet].isRegistered) return 2;
+        return 0;
+    }
+
+    // ==========================================
+    // 6. CORE LOGIC (C-E-I PATTERN TRICTLY APPLIED)
+    // ==========================================
+    function registerCompanyWithWallet(
+        string calldata _name,
+        uint8 _shiftMode,
+        uint16 _shift1Start,
+        uint16 _shift2Start,
+        uint16 _shift3Start,
+        int8 _timezoneOffset
+    ) external payable nonReentrant {
+        // [CHECKS]
+        require(!companies[msg.sender].isRegistered, "ShidoGuard: Wallet ini sudah memiliki PT");
+        require(_shiftMode == 2 || _shiftMode == 3, "ShidoGuard: Mode shift 2 atau 3");
+
+        uint256 fee = (msg.value * platformFeeBps) / 10000;
+        uint256 netGas = msg.value - fee;
+
+        // [EFFECTS]
+        if (fee > 0) {
+            totalPlatformFeeEarned += fee;
+        }
+        totalCompaniesRegistered++;
+
+        companies[msg.sender] = Company({
+            adminWallet: msg.sender,
+            name: _name,
+            gasTankBalance: netGas,
+            maxGasPriceRefund: 50 gwei,
+            initialGuardFloat: 0.02 ether,
+            shiftRule: ShiftRule(_shiftMode, _shift1Start, _shift2Start, _shift3Start, _timezoneOffset),
+            totalGuards: 0,
+            totalLogs: 0,
+            isRegistered: true
+        });
+
+        // [INTERACTIONS] (Selalu letakkan transfer ke eksternal di akhir)
+        if (fee > 0) {
+            (bool success, ) = payable(platformOwner).call{value: fee}("");
+            require(success, "ShidoGuard: Gagal transfer komisi platform");
+        }
+
+        emit CompanyRegistered(msg.sender, netGas, fee);
+    }
+
+    function depositGasTank() external payable nonReentrant onlyCompanyAdmin {
+        uint256 fee = (msg.value * platformFeeBps) / 10000;
+        uint256 netAdded = msg.value - fee;
+
+        // [EFFECTS]
+        if (fee > 0) {
+            totalPlatformFeeEarned += fee;
+        }
+        companies[msg.sender].gasTankBalance += netAdded;
+
+        // [INTERACTIONS]
+        if (fee > 0) {
+            (bool success, ) = payable(platformOwner).call{value: fee}("");
+            require(success, "ShidoGuard: Gagal transfer komisi platform");
+        }
+
+        emit GasTankDeposited(msg.sender, netAdded, fee, companies[msg.sender].gasTankBalance);
+    }
+
+    function withdrawGasTank(uint256 _amount) external nonReentrant onlyCompanyAdmin {
+        // [CHECKS]
+        require(companies[msg.sender].gasTankBalance >= _amount, "ShidoGuard: Saldo tangki kurang");
+        
+        // [EFFECTS]
+        companies[msg.sender].gasTankBalance -= _amount;
+        
+        // [INTERACTIONS]
+        (bool success, ) = payable(msg.sender).call{value: _amount}("");
+        require(success, "ShidoGuard: Gagal menarik dana, periksa gas/smart contract penerima");
+        
+        emit GasTankWithdrawn(msg.sender, _amount);
+    }
+
+    function updateShiftRule(
+        uint8 _shiftMode,
+        uint16 _shift1Start,
+        uint16 _shift2Start,
+        uint16 _shift3Start,
+        int8 _timezoneOffset
+    ) external onlyCompanyAdmin {
+        require(_shiftMode == 2 || _shiftMode == 3, "ShidoGuard: Hanya 2 atau 3 shift");
+        companies[msg.sender].shiftRule = ShiftRule(_shiftMode, _shift1Start, _shift2Start, _shift3Start, _timezoneOffset);
+        emit ShiftRuleUpdated(msg.sender, _shiftMode, _shift1Start, _shift2Start, _shift3Start, _timezoneOffset);
+    }
+
+    // ==========================================
+    // 7. CRUD HIERARKI (DENGAN ZERO-CHECK)
+    // ==========================================
+    function saveZone(bytes32 _zoneId, string calldata _name, bool _isActive) external onlyCompanyAdmin {
+        require(_zoneId != bytes32(0), "ShidoGuard: ID Zone tidak valid");
+        if (companyZones[msg.sender][_zoneId].zoneId == bytes32(0)) {
+            companyZoneList[msg.sender].push(_zoneId);
+        }
+        companyZones[msg.sender][_zoneId] = Zone(_zoneId, _name, _isActive);
+        emit ZoneSaved(msg.sender, _zoneId, _isActive);
+    }
+
+    function savePost(bytes32 _zoneId, bytes32 _postId, string calldata _name, bool _isActive) external onlyCompanyAdmin {
+        require(_postId != bytes32(0), "ShidoGuard: ID Post tidak valid");
+        if (companyPosts[msg.sender][_postId].postId == bytes32(0)) {
+            companyPostList[msg.sender].push(_postId);
+        }
+        companyPosts[msg.sender][_postId] = Post(_postId, _zoneId, _name, _isActive);
+        emit PostSaved(msg.sender, _zoneId, _postId, _isActive);
+    }
+
+    function saveNFCPoint(
+        bytes32 _zoneId,
+        bytes32 _postId,
+        bytes32 _nfcHash,
+        string calldata _nfcName,
+        string calldata _defaultTapNote,
+        bool _isActive
+    ) external onlyCompanyAdmin {
+        require(_nfcHash != bytes32(0), "ShidoGuard: Hash NFC tidak valid");
+        if (companyNFCPoints[msg.sender][_nfcHash].nfcHash == bytes32(0)) {
+            companyNfcList[msg.sender].push(_nfcHash);
+        }
+        companyNFCPoints[msg.sender][_nfcHash] = NFCPoint({
+            nfcHash: _nfcHash,
+            zoneId: _zoneId,
+            postId: _postId,
+            nfcName: _nfcName,
+            defaultTapNote: _defaultTapNote,
+            isActive: _isActive
+        });
+        emit NFCPointSaved(msg.sender, _postId, _nfcHash, _defaultTapNote, _isActive);
+    }
+
+    function editNfcDefaultNote(bytes32 _nfcHash, string calldata _newDefaultTapNote) external onlyCompanyAdmin {
+        NFCPoint storage pt = companyNFCPoints[msg.sender][_nfcHash];
+        require(pt.nfcHash != bytes32(0), "ShidoGuard: NFC tidak valid");
+        pt.defaultTapNote = _newDefaultTapNote;
+        if (nfcDailyStatus[msg.sender][_nfcHash].isPhysicallyTapped) {
+            nfcDailyStatus[msg.sender][_nfcHash].note = _newDefaultTapNote;
+        }
+    }
+
+    function saveGuard(
+        bytes32 _usernameHash,
+        address _guardWallet,
+        string calldata _profile,
+        bytes32 _initialZoneId,
+        bytes32 _initialPostId,
+        bool _isActive
+    ) external nonReentrant onlyCompanyAdmin {
+        require(_usernameHash != bytes32(0), "ShidoGuard: Hash username kosong");
+        require(_guardWallet != address(0), "ShidoGuard: Wallet guard tidak boleh 0x0");
+        
+        if (companyGuards[msg.sender][_usernameHash].usernameHash == bytes32(0)) {
+            companyGuardList[msg.sender].push(_usernameHash);
+        }
+        GuardAccount storage g = companyGuards[msg.sender][_usernameHash];
+        
+        if (g.activeWallet == address(0) && _isActive) {
+            companies[msg.sender].totalGuards++;
+        } else if (g.isActive && !_isActive && companies[msg.sender].totalGuards > 0) {
+            companies[msg.sender].totalGuards--;
+        }
+
+        if (g.activeWallet != address(0) && g.activeWallet != _guardWallet) {
+            delete walletToUsernameHash[msg.sender][g.activeWallet];
+        }
+
+        g.usernameHash = _usernameHash;
+        g.activeWallet = _guardWallet;
+        g.profile = _profile;
+        g.currentZoneId = _initialZoneId;
+        g.currentPostId = _initialPostId;
+        g.isActive = _isActive;
+
+        if (_isActive && _guardWallet != address(0)) {
+            walletToUsernameHash[msg.sender][_guardWallet] = _usernameHash;
+            // [C-E-I applied to Guard Seeding]
+            if (_guardWallet.balance < companies[msg.sender].initialGuardFloat) {
+                uint256 needed = companies[msg.sender].initialGuardFloat - _guardWallet.balance;
+                if (companies[msg.sender].gasTankBalance >= needed) {
+                    companies[msg.sender].gasTankBalance -= needed;
+                    (bool ok, ) = payable(_guardWallet).call{value: needed}("");
+                    if (!ok) {
+                        companies[msg.sender].gasTankBalance += needed; 
+                    }
+                }
+            }
+        }
+    }
+
+    // ==========================================
+    // 8. WAKTU & KALKULASI (INT256 FIX)
+    // ==========================================
+    function getCurrentDayIndex(address _adminWallet, uint256 _timestamp) public view returns (uint256) {
+        int8 tz = companies[_adminWallet].shiftRule.timezoneOffset;
+        int256 localSec = int256(_timestamp) + (int256(tz) * 3600);
+        return uint256(localSec > 0 ? localSec : int256(0)) / 86400;
+    }
+
+    function _detectShift(address _adminWallet, uint256 _timestamp) internal view returns (uint8) {
+        ShiftRule memory r = companies[_adminWallet].shiftRule;
+        int256 localSec = int256(_timestamp) + (int256(r.timezoneOffset) * 3600);
+        uint16 minOfDay = uint16((uint256(localSec > 0 ? localSec : int256(0)) % 86400) / 60);
+
+        if (r.shiftMode == 2) {
+            if (r.shift1Start < r.shift2Start) {
+                return (minOfDay >= r.shift1Start && minOfDay < r.shift2Start) ? 1 : 2;
+            } else {
+                return (minOfDay >= r.shift2Start && minOfDay < r.shift1Start) ? 2 : 1;
+            }
+        } else {
+            if (minOfDay >= r.shift1Start && minOfDay < r.shift2Start) return 1;
+            if (minOfDay >= r.shift2Start && minOfDay < r.shift3Start) return 2;
+            return 3;
+        }
+    }
+
+    // ==========================================
+    // 9. LOGIKA PATROLI (DENGAN PROTEKSI OOG)
+    // ==========================================
+    function _recordPatrolInternal(
+        address _adminWallet,
+        bytes32 _uHash,
+        bytes32 _hardwareNfcHash,
+        bytes32 _manualNfcHash,
+        bool _isPhysicallyTapped,
+        string memory _note,
+        bool _isOfflineSynced,
+        uint256 _verifiedTapTime,
+        uint256 _gasRefunded
+    ) internal {
+        bytes32 finalNfc = _isPhysicallyTapped ? _hardwareNfcHash : _manualNfcHash;
+        NFCPoint memory pt = companyNFCPoints[_adminWallet][finalNfc];
+        require(pt.isActive, "ShidoGuard: Titik NFC tidak aktif/dihapus");
+
+        string memory finalNote = _isPhysicallyTapped ? pt.defaultTapNote : _note;
+        GuardAccount storage guard = companyGuards[_adminWallet][_uHash];
+        
+        uint256 safeTime = (!_isOfflineSynced || _verifiedTapTime == 0 || _verifiedTapTime > block.timestamp) ? block.timestamp : _verifiedTapTime;
+        require(safeTime >= guard.lastVerifiedTapTime, "ShidoGuard: Terdeteksi manipulasi jam (Anti-Backdating)");
+        guard.lastVerifiedTapTime = safeTime;
+
+        if (guard.currentZoneId != pt.zoneId || guard.currentPostId != pt.postId) {
+            guard.currentZoneId = pt.zoneId;
+            guard.currentPostId = pt.postId;
+            emit GuardAutoRolled(_adminWallet, _uHash, pt.zoneId, pt.postId);
+        }
+
+        uint256 dayIdx = getCurrentDayIndex(_adminWallet, safeTime);
+        uint8 shiftIdx = _detectShift(_adminWallet, safeTime);
+        uint256 logId = companies[_adminWallet].totalLogs;
+
+        nfcDailyStatus[_adminWallet][finalNfc] = NFCDailyStatus(dayIdx, safeTime, _uHash, shiftIdx, _isPhysicallyTapped, finalNote);
+        companies[_adminWallet].totalLogs++;
+
+        emit PatrolRecorded(_adminWallet, logId, dayIdx, _uHash, pt.zoneId, pt.postId, finalNfc, _isPhysicallyTapped, _isOfflineSynced, shiftIdx, safeTime, _gasRefunded);
+    }
+
+    function _refundGas(address _adminWallet, uint256 _startGas) internal {
+        Company storage comp = companies[_adminWallet];
+        uint256 gasUsed = _startGas - gasleft() + GAS_OVERHEAD;
+        uint256 effectiveGasPrice = tx.gasprice > comp.maxGasPriceRefund ? comp.maxGasPriceRefund : tx.gasprice;
+        uint256 cost = gasUsed * effectiveGasPrice;
+        
+        if (comp.gasTankBalance >= cost && cost > 0) {
+            comp.gasTankBalance -= cost;
+            (bool ok, ) = payable(msg.sender).call{value: cost}("");
+            if (!ok) {
+                comp.gasTankBalance += cost; 
+            }
+        }
+    }
+
+    function submitPatrolOnline(
+        address _adminWallet, 
+        bytes32 _hwNfcHash, 
+        bytes32 _manNfcHash, 
+        bool _isPhysicallyTapped, 
+        string calldata _reason
+    ) external nonReentrant onlyActiveGuard(_adminWallet) {
+        uint256 startGas = gasleft();
+        _recordPatrolInternal(_adminWallet, walletToUsernameHash[_adminWallet][msg.sender], _hwNfcHash, _manNfcHash, _isPhysicallyTapped, _reason, false, block.timestamp, 0);
+        _refundGas(_adminWallet, startGas);
+    }
+
+    function submitOfflineBatchPatrol(
+        address _adminWallet, 
+        bytes32[] calldata _hwNfcHashes, 
+        bytes32[] calldata _manNfcHashes, 
+        bool[] calldata _isTappedList, 
+        string[] calldata _reasons, 
+        uint256[] calldata _tapTimes
+    ) external nonReentrant onlyActiveGuard(_adminWallet) {
+        uint256 startGas = gasleft();
+        uint256 len = _hwNfcHashes.length;
+        
+        // SIASAT 3: Membatasi Loop Array agar tidak melampaui Block Gas Limit
+        require(len > 0 && len <= 50, "ShidoGuard: Maksimal 50 data per batch");
+        require(len == _manNfcHashes.length && len == _isTappedList.length && len == _reasons.length && len == _tapTimes.length, "ShidoGuard: Array length mismatch");
+
+        bytes32 uHash = walletToUsernameHash[_adminWallet][msg.sender];
+        for (uint256 i = 0; i < len; i++) {
+            _recordPatrolInternal(_adminWallet, uHash, _hwNfcHashes[i], _manNfcHashes[i], _isTappedList[i], _reasons[i], true, _tapTimes[i], 0);
+        }
+        _refundGas(_adminWallet, startGas);
+    }
+
+    function getGuardTodayPostReport(address _adminWallet, bytes32 _nfcHash) external view onlyActiveGuard(_adminWallet) returns (bool hasReportToday, bool isPhysicallyTapped, uint8 shiftIndex, uint256 tapTime, string memory note) {
+        bytes32 uHash = walletToUsernameHash[_adminWallet][msg.sender];
+        GuardAccount memory guard = companyGuards[_adminWallet][uHash];
+        NFCPoint memory pt = companyNFCPoints[_adminWallet][_nfcHash];
+        require(pt.zoneId == guard.currentZoneId && pt.postId == guard.currentPostId, "ShidoGuard: Bukan wilayah operasi Anda");
+
+        uint256 todayIdx = getCurrentDayIndex(_adminWallet, block.timestamp);
+        NFCDailyStatus memory st = nfcDailyStatus[_adminWallet][_nfcHash];
+
+        if (st.lastTapTime == 0 || st.lastDayIndex < todayIdx) return (false, false, 0, 0, "");
+        return (true, st.isPhysicallyTapped, st.shiftIndex, st.lastTapTime, st.note);
+    }
+
+    // ==========================================
+    // 10. GETTER ARRAYS (UNTUK SINKRONISASI INDEX.HTML)
+    // ==========================================
+    function getCompanyZoneIds(address _adminWallet) external view returns (bytes32[] memory) { return companyZoneList[_adminWallet]; }
+    function getCompanyPostIds(address _adminWallet) external view returns (bytes32[] memory) { return companyPostList[_adminWallet]; }
+    function getCompanyNfcIds(address _adminWallet) external view returns (bytes32[] memory) { return companyNfcList[_adminWallet]; }
+    function getCompanyGuardUsernames(address _adminWallet) external view returns (bytes32[] memory) { return companyGuardList[_adminWallet]; }
+}
